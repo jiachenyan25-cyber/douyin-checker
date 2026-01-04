@@ -114,12 +114,15 @@ def fetch_one(url: str, timeout: int = 12, sleep_s: float = 0.3) -> Dict[str, An
     return data
 
 
-@app.get("/")
+from fastapi.responses import HTMLResponse
+import os
+
+@app.get("/", response_class=HTMLResponse)
 def home():
-    return {
-        "usage": "POST /check with JSON array of links",
-        "example": ["https://www.iesdouyin.com/share/video/7591032840314935924"]
-    }
+    # 读取同目录下的 index.html 并返回
+    path = os.path.join(os.path.dirname(__file__), "index.html")
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
 
 
 @app.post("/check")
