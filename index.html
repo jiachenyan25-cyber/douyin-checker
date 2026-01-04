@@ -6,12 +6,14 @@
   <title>抖音链接批量检测</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Arial, sans-serif; margin: 24px; }
-    h1 { margin: 0 0 12px; }
-    .box { max-width: 980px; }
-    textarea { width: 100%; height: 220px; padding: 12px; font-size: 14px; }
+    h1 { margin: 0 0 10px; }
+    .box { max-width: 1100px; }
+    textarea { width: 100%; height: 220px; padding: 12px; font-size: 14px; box-sizing: border-box; }
     button { padding: 10px 14px; font-size: 14px; cursor: pointer; }
+    input, select { padding: 6px 8px; }
     .row { display: flex; gap: 12px; align-items: center; margin: 12px 0; flex-wrap: wrap; }
-    .hint { color: #555; font-size: 13px; }
+    .hint { color: #555; font-size: 13px; line-height: 1.4; }
+    .summary { margin-top: 8px; font-size: 13px; color: #333; }
     table { width: 100%; border-collapse: collapse; margin-top: 14px; }
     th, td { border: 1px solid #ddd; padding: 8px; font-size: 13px; vertical-align: top; }
     th { background: #f6f6f6; }
@@ -19,39 +21,104 @@
     .valid { background:#e8fff0; }
     .maybe { background:#fff6db; }
     .invalid { background:#ffe8e8; }
+    .blocked { background:#e9f2ff; }
     .unknown { background:#eee; }
     a { word-break: break-all; }
+    .small { font-size: 12px; color:#666; }
   </style>
 </head>
 <body>
   <div class="box">
     <h1>抖音分享链接批量检测</h1>
-    <div class="hint">把链接粘贴到下面（一行一个），点击“开始检测”。结果会显示在表格里，并支持下载 CSV。</div>
+    <div class="hint">
+      <div>用法：把链接粘贴到下面（<b>一行一个</b>），点击“开始检测”。</div>
+      <div>判定说明：</div>
+      <div class="small">
+        <b>valid</b>：抓到 aweme_id / itemId / note_id（基本确认有效）；
+        <b>invalid</b>：页面明确提示不存在/删除/下架 或 HTTP 404/410；
+        <b>blocked</b>：服务器疑似被抖音风控（403/429/验证码/空壳页面）；
+        <b>maybe</b>：信息不足，无法确认；
+        <b>unknown</b>：网络/服务器错误。
+      </div>
+    </div>
 
     <textarea id="links" placeholder="一行一个链接，例如：
 https://www.iesdouyin.com/share/video/7591032840314935924
-https://www.iesdouyin.com/share/video/7591032333329086961
+https://www.douyin.com/note/7591004839467964145
 "></textarea>
 
     <div class="row">
+      <label>判定策略：
+        <select id="policy">
+          <option value="conservative" selected>保守（不误杀：blocked/maybe 单独显示）</option>
+          <option value="strict">严格（把 blocked/maybe 按无效处理）</option>
+        </select>
+      </label>
+
+      <label>每批条数：
+        <input id="batchSize" type="number" min="1" max="25" value="20" style="width:70px" />
+      </label>
+
+      <label>批间等待(秒)：
+        <input id="batchDelay" type="number" min="0" step="0.1" value="1.0" style="width:80px" />
+      </label>
+
+      <label>服务器每条延迟(秒)：
+        <input id="sleepS" type="number" min="0" step="0.1" value="0.6" style="width:80px" />
+      </label>
+
+      <label>超时(秒)：
+        <input id="timeoutS" type="number" min="3" step="1" value="12" style="width:70px" />
+      </label>
+    </div>
+
+    <div class="row">
       <button id="run">开始检测</button>
+      <button id="cancel" disabled>取消</button>
       <button id="download" disabled>下载 CSV</button>
       <span id="status" class="hint"></span>
     </div>
 
+    <div id="summary" class="summary"></div>
     <div id="result"></div>
   </div>
 
 <script>
   const runBtn = document.getElementById('run');
+  const cancelBtn = document.getElementById('cancel');
   const dlBtn = document.getElementById('download');
   const statusEl = document.getElementById('status');
+  const summaryEl = document.getElementById('summary');
   const resultEl = document.getElementById('result');
 
+  const policyEl = document.getElementById('policy');
+  const batchSizeEl = document.getElementById('batchSize');
+  const batchDelayEl = document.getElementById('batchDelay');
+  const sleepSEl = document.getElementById('sleepS');
+  const timeoutSEl = document.getElementById('timeoutS');
+
   let lastResults = null;
+  let abortFlag = false;
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
   function toLines(text) {
     return text.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  }
+
+  function uniqKeepOrder(arr) {
+    const seen = new Set();
+    const out = [];
+    for (const x of arr) {
+      if (!seen.has(x)) { seen.add(x); out.push(x); }
+    }
+    return out;
+  }
+
+  function chunk(arr, size) {
+    const out = [];
+    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+    return out;
   }
 
   function esc(s) {
@@ -64,20 +131,40 @@ https://www.iesdouyin.com/share/video/7591032333329086961
     if (v === "valid") return "tag valid";
     if (v === "maybe") return "tag maybe";
     if (v === "invalid") return "tag invalid";
+    if (v === "blocked") return "tag blocked";
     return "tag unknown";
+  }
+
+  function countBy(results) {
+    const c = {valid:0, invalid:0, blocked:0, maybe:0, unknown:0};
+    for (const r of results) {
+      const v = r.validity || "unknown";
+      if (c[v] === undefined) c[v] = 0;
+      c[v] += 1;
+    }
+    return c;
+  }
+
+  function renderSummary(results, total) {
+    const c = countBy(results);
+    summaryEl.innerHTML = `已完成 ${results.length}/${total}：
+      valid ${c.valid}；invalid ${c.invalid}；blocked ${c.blocked}；maybe ${c.maybe}；unknown ${c.unknown}`;
   }
 
   function renderTable(results) {
     const rows = results.map(r => {
       const v = r.validity || "unknown";
+      const raw = r.raw_validity || "";
       const finalUrl = r.final_url ? `<a href="${esc(r.final_url)}" target="_blank">${esc(r.final_url)}</a>` : "";
       return `<tr>
         <td>${esc(r.original_url)}</td>
-        <td><span class="${tagClass(v)}">${esc(v)}</span></td>
+        <td><span class="${tagClass(v)}">${esc(v)}</span><div class="small">raw: ${esc(raw)}</div></td>
         <td>${esc(r.http_status ?? "")}</td>
-        <td>${esc(r.video_id_in_url ?? "")}</td>
+        <td>${esc(r.kind ?? "")}<div class="small">${esc(r.url_id ?? "")}</div></td>
         <td>${esc(r.aweme_id ?? "")}</td>
         <td>${esc(r.item_id ?? "")}</td>
+        <td>${esc(r.note_id ?? "")}</td>
+        <td>${esc(r.confidence ?? "")}</td>
         <td>${finalUrl}</td>
         <td>${esc(r.note ?? "")}</td>
       </tr>`;
@@ -90,9 +177,11 @@ https://www.iesdouyin.com/share/video/7591032333329086961
             <th>原链接</th>
             <th>判定</th>
             <th>HTTP</th>
-            <th>video_id</th>
+            <th>类型/ID</th>
             <th>aweme_id</th>
             <th>item_id</th>
+            <th>note_id</th>
+            <th>置信度</th>
             <th>最终跳转</th>
             <th>备注</th>
           </tr>
@@ -103,7 +192,11 @@ https://www.iesdouyin.com/share/video/7591032333329086961
   }
 
   function downloadCSV(results) {
-    const header = ["original_url","validity","http_status","video_id_in_url","aweme_id","item_id","final_url","note"];
+    const header = [
+      "original_url","validity","raw_validity","confidence",
+      "http_status","kind","url_id","aweme_id","item_id","note_id",
+      "final_url","content_len","elapsed_ms","note"
+    ];
     const lines = [header.join(",")];
     for (const r of results) {
       const row = header.map(k => {
@@ -123,34 +216,79 @@ https://www.iesdouyin.com/share/video/7591032333329086961
     URL.revokeObjectURL(url);
   }
 
+  cancelBtn.onclick = () => {
+    abortFlag = true;
+    cancelBtn.disabled = true;
+    statusEl.textContent = "正在取消…";
+  };
+
   runBtn.onclick = async () => {
-    const links = toLines(document.getElementById('links').value);
+    abortFlag = false;
+    lastResults = null;
+    dlBtn.disabled = true;
+    resultEl.innerHTML = "";
+    summaryEl.innerHTML = "";
+
+    const links = uniqKeepOrder(toLines(document.getElementById('links').value));
     if (!links.length) {
       alert("请先粘贴至少 1 个链接");
       return;
     }
-    statusEl.textContent = "检测中…（如果链接很多，可能需要几十秒）";
-    runBtn.disabled = true;
-    dlBtn.disabled = true;
-    resultEl.innerHTML = "";
 
+    const policy = policyEl.value;
+    const batchSize = Math.max(1, Math.min(parseInt(batchSizeEl.value || "20", 10), 25));
+    const batchDelayMs = Math.max(0, parseFloat(batchDelayEl.value || "1.0")) * 1000;
+    const sleepS = Math.max(0, parseFloat(sleepSEl.value || "0.6"));
+    const timeoutS = Math.max(3, parseFloat(timeoutSEl.value || "12"));
+
+    const batches = chunk(links, batchSize);
+
+    runBtn.disabled = true;
+    cancelBtn.disabled = false;
+
+    const all = [];
     try {
-      const resp = await fetch("/check", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify(links)
-      });
-      const data = await resp.json();
-      lastResults = data.results || [];
-      renderTable(lastResults);
-      dlBtn.disabled = lastResults.length === 0;
-      statusEl.textContent = `完成：共 ${data.count ?? lastResults.length} 条`;
+      for (let i = 0; i < batches.length; i++) {
+        if (abortFlag) break;
+        const start = i * batchSize + 1;
+        const end = Math.min((i + 1) * batchSize, links.length);
+        statusEl.textContent = `检测中… 第 ${i+1}/${batches.length} 批（${start}-${end}/${links.length}）`;
+
+        const url = `/check?policy=${encodeURIComponent(policy)}&sleep_s=${encodeURIComponent(sleepS)}&timeout_s=${encodeURIComponent(timeoutS)}`;
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(batches[i])
+        });
+
+        if (!resp.ok) {
+          const t = await resp.text();
+          throw new Error(`HTTP ${resp.status}: ${t}`);
+        }
+
+        const data = await resp.json();
+        const results = data.results || [];
+        all.push(...results);
+
+        renderSummary(all, links.length);
+        renderTable(all);
+
+        if (i < batches.length - 1 && batchDelayMs > 0) {
+          await sleep(batchDelayMs);
+        }
+      }
+
+      lastResults = all;
+      dlBtn.disabled = !lastResults || lastResults.length === 0;
+
+      statusEl.textContent = abortFlag ? "已取消" : `完成：共 ${all.length} 条`;
     } catch (e) {
       console.error(e);
-      statusEl.textContent = "出错了：请稍后重试（可能是网络或风控）";
-      alert("请求失败，请稍后重试。");
+      statusEl.textContent = "出错：请稍后重试（可能是网络/风控/请求过多）";
+      alert(String(e));
     } finally {
       runBtn.disabled = false;
+      cancelBtn.disabled = true;
     }
   };
 
