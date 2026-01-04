@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>抖音链接批量检测</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Arial, sans-serif; margin: 24px; }
+    h1 { margin: 0 0 12px; }
+    .box { max-width: 980px; }
+    textarea { width: 100%; height: 220px; padding: 12px; font-size: 14px; }
+    button { padding: 10px 14px; font-size: 14px; cursor: pointer; }
+    .row { display: flex; gap: 12px; align-items: center; margin: 12px 0; flex-wrap: wrap; }
+    .hint { color: #555; font-size: 13px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 14px; }
+    th, td { border: 1px solid #ddd; padding: 8px; font-size: 13px; vertical-align: top; }
+    th { background: #f6f6f6; }
+    .tag { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; }
+    .valid { background:#e8fff0; }
+    .maybe { background:#fff6db; }
+    .invalid { background:#ffe8e8; }
+    .unknown { background:#eee; }
+    a { word-break: break-all; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>抖音分享链接批量检测</h1>
+    <div class="hint">把链接粘贴到下面（一行一个），点击“开始检测”。结果会显示在表格里，并支持下载 CSV。</div>
+
+    <textarea id="links" placeholder="一行一个链接，例如：
+https://www.iesdouyin.com/share/video/7591032840314935924
+https://www.iesdouyin.com/share/video/7591032333329086961
+"></textarea>
+
+    <div class="row">
+      <button id="run">开始检测</button>
+      <button id="download" disabled>下载 CSV</button>
+      <span id="status" class="hint"></span>
+    </div>
+
+    <div id="result"></div>
+  </div>
+
+<script>
+  const runBtn = document.getElementById('run');
+  const dlBtn = document.getElementById('download');
+  const statusEl = document.getElementById('status');
+  const resultEl = document.getElementById('result');
+
+  let lastResults = null;
+
+  function toLines(text) {
+    return text.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  }
+
+  function esc(s) {
+    return (s ?? "").toString()
+      .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
+      .replaceAll('"',"&quot;").replaceAll("'","&#039;");
+  }
+
+  function tagClass(v) {
+    if (v === "valid") return "tag valid";
+    if (v === "maybe") return "tag maybe";
+    if (v === "invalid") return "tag invalid";
+    return "tag unknown";
+  }
+
+  function renderTable(results) {
+    const rows = results.map(r => {
+      const v = r.validity || "unknown";
+      const finalUrl = r.final_url ? `<a href="${esc(r.final_url)}" target="_blank">${esc(r.final_url)}</a>` : "";
+      return `<tr>
+        <td>${esc(r.original_url)}</td>
+        <td><span class="${tagClass(v)}">${esc(v)}</span></td>
+        <td>${esc(r.http_status ?? "")}</td>
+        <td>${esc(r.video_id_in_url ?? "")}</td>
+        <td>${esc(r.aweme_id ?? "")}</td>
+        <td>${esc(r.item_id ?? "")}</td>
+        <td>${finalUrl}</td>
+        <td>${esc(r.note ?? "")}</td>
+      </tr>`;
+    }).join("");
+
+    resultEl.innerHTML = `
+      <table>
+        <thead>
+          <tr>
+            <th>原链接</th>
+            <th>判定</th>
+            <th>HTTP</th>
+            <th>video_id</th>
+            <th>aweme_id</th>
+            <th>item_id</th>
+            <th>最终跳转</th>
+            <th>备注</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    `;
+  }
+
+  function downloadCSV(results) {
+    const header = ["original_url","validity","http_status","video_id_in_url","aweme_id","item_id","final_url","note"];
+    const lines = [header.join(",")];
+    for (const r of results) {
+      const row = header.map(k => {
+        const val = (r[k] ?? "").toString().replaceAll('"','""');
+        return `"${val}"`;
+      });
+      lines.push(row.join(","));
+    }
+    const blob = new Blob([lines.join("\n")], {type: "text/csv;charset=utf-8"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "douyin_check_result.csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  runBtn.onclick = async () => {
+    const links = toLines(document.getElementById('links').value);
+    if (!links.length) {
+      alert("请先粘贴至少 1 个链接");
+      return;
+    }
+    statusEl.textContent = "检测中…（如果链接很多，可能需要几十秒）";
+    runBtn.disabled = true;
+    dlBtn.disabled = true;
+    resultEl.innerHTML = "";
+
+    try {
+      const resp = await fetch("/check", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(links)
+      });
+      const data = await resp.json();
+      lastResults = data.results || [];
+      renderTable(lastResults);
+      dlBtn.disabled = lastResults.length === 0;
+      statusEl.textContent = `完成：共 ${data.count ?? lastResults.length} 条`;
+    } catch (e) {
+      console.error(e);
+      statusEl.textContent = "出错了：请稍后重试（可能是网络或风控）";
+      alert("请求失败，请稍后重试。");
+    } finally {
+      runBtn.disabled = false;
+    }
+  };
+
+  dlBtn.onclick = () => {
+    if (lastResults) downloadCSV(lastResults);
+  };
+</script>
+</body>
+</html>
